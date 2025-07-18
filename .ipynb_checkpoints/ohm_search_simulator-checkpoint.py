@@ -271,59 +271,7 @@ def apply_dayneu_filter(spectrum, frequencies_mhz, delay_cutoff_ns, weights=None
 
     return filtered_spectrum, foreground_model
 
-def apply_windowed_delay_filter(
-    spectrum: np.ndarray,
-    weights: np.ndarray,
-    freqs_mhz: np.ndarray,
-    delay_cut_ns: float
-) -> np.ndarray:
-    """
-    Applies a more realistic delay filter by using a smooth window function
-    to suppress foreground-dominated modes in the delay domain.
 
-    This method is more faithful to a real pipeline filter as it is less
-    prone to ringing artifacts than a "brick-wall" cut.
-
-    Args:
-        spectrum: The 1D input data slice.
-        weights: The weights array (0 for flagged channels).
-        freqs_mhz: The frequency axis in MHz, used to calculate the cut.
-        delay_cut_ns: The delay at which the filter's suppression begins, in ns.
-
-    Returns:
-        The real part of the filtered spectrum.
-    """
-    # 1. Calculate the total bandwidth in Hz
-    bandwidth_hz = (np.max(freqs_mhz) - np.min(freqs_mhz)) * 1e6
-    if bandwidth_hz == 0:
-        return spectrum
-        
-    # 2. Convert the desired delay cut into an integer number of channels
-    delay_cut_s = delay_cut_ns * 1e-9
-    notch_width = int(np.round(delay_cut_s * bandwidth_hz))
-    
-    # 3. Create a smooth windowing function
-    # A Tukey window is flat in the middle with tapered cosine edges.
-    # We create a window that is the size of the notch on each side.
-    num_modes_to_window = notch_width * 2
-    if num_modes_to_window <= 0 or num_modes_to_window >= len(spectrum):
-        return np.zeros_like(spectrum) # Return zero if the filter is too wide
-        
-    window = tukey(num_modes_to_window, alpha=1.0) # alpha=1.0 is a full cosine taper
-    
-    # The filter is a multiplication in the Fourier domain. 1 passes, 0 blocks.
-    fft_filter = np.ones_like(spectrum, dtype=float)
-    fft_filter[:notch_width] = window[:notch_width]
-    fft_filter[-notch_width:] = window[notch_width:]
-    
-    # 4. Apply the filter
-    delay_spectrum = np.fft.fft(spectrum * weights)
-    filtered_delay_spectrum = delay_spectrum * fft_filter
-    filtered_spectrum = np.fft.ifft(filtered_delay_spectrum)
-    
-    return filtered_spectrum.real
-
-    
 # =============================================================================
 # --- Component Functions: Sky and Weight Generation ---
 # =============================================================================
