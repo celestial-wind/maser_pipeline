@@ -70,20 +70,21 @@ def generate_realistic_rfi_mask(freqs: np.ndarray, percentage_random=0.01) -> np
     return weights
 
 
+import numpy as np
+
+
 def infill_rfi(
     spectrum: np.ndarray,
     weights: np.ndarray,
-    frequencies: np.ndarray,
-    fit_mode: str = 'global',
-    local_fit_padding: int = 10
+    frequencies: np.ndarray
 ) -> np.ndarray:
     """
-    Infills RFI-flagged regions in a spectrum using a power-law fit.
+    Infills RFI-flagged regions in a spectrum using a robust power-law fit.
 
-    This function identifies flagged regions (where weight is 0), fits a
-    power-law model to the surrounding valid data, and uses this model to
-    interpolate values for the flagged channels. It then adds synthetic noise
-    based on the spectrum's characteristics.
+    This function identifies flagged regions (where weight is 0), fits a single
+    global power-law model to the valid, positive data points in the spectrum,
+    and uses this model to interpolate values for the flagged channels.
+    It then adds synthetic noise based on the spectrum's characteristics.
 
     Parameters
     ----------
@@ -94,16 +95,6 @@ def infill_rfi(
         flagged for RFI and will be infilled.
     frequencies : np.ndarray
         The corresponding frequency axis for the spectrum.
-    fit_mode : str, optional
-        The method for fitting the power law. Can be 'global' or 'local'.
-        - 'global': Fits a single power law to all valid data in the spectrum.
-          Faster but less accurate if the spectral index varies.
-        - 'local': Fits a separate power law for each RFI zone using nearby
-          valid data. More accurate but slower.
-        Defaults to 'local'.
-    local_fit_padding : int, optional
-        The number of valid channels on each side of an RFI zone to use for
-        the fit when `fit_mode` is 'local'. Defaults to 10.
 
     Returns
     -------
@@ -111,13 +102,7 @@ def infill_rfi(
         A new spectrum array with the RFI-flagged zones infilled.
     """
     # --- 1. Setup and Input Validation ---
-    if fit_mode not in ['global', 'local']:
-        raise ValueError("fit_mode must be either 'global' or 'local'")
-
-    # Create a copy of the spectrum to modify and return
     infilled_spectrum = np.copy(spectrum)
-
-    # Identify valid (unflagged) and invalid (flagged) data points
     valid_indices = weights > 0
     flagged_indices = ~valid_indices
 
@@ -125,53 +110,42 @@ def infill_rfi(
     if not np.any(flagged_indices):
         return infilled_spectrum
 
-    # --- 2. Fit Power-Law Model ---
-    # A power law y = A * x^k becomes linear in log-log space:
-    # log(y) = k * log(x) + log(A). We fit this line.
-    power_law_model = np.zeros_like(spectrum)
+    # --- 2. Robust Power-Law Fit ---
+    # To prevent log10 errors, we must fit only to valid AND positive data.
+    positive_valid_indices = valid_indices & (spectrum > 0)
 
-    if fit_mode == 'global':
-        # Use all valid data for a single fit
-        log_freq = np.log10(frequencies[valid_indices])
-        log_spec = np.log10(spectrum[valid_indices])
-        # Fit a line (degree 1 polynomial) to the log-log data
-        k, log_A = np.polyfit(log_freq, log_spec, 1)
-        # Generate the model for all frequencies
-        power_law_model = (10**log_A) * (frequencies**k)
+    # Check if there are enough positive points for a stable fit
+    if np.sum(positive_valid_indices) < 2:
+        # Fallback: if no stable fit is possible, just fill with noise
+        # calculated from the entire valid spectrum.
+        noise_sigma = np.std(spectrum[valid_indices])
+        if np.isnan(noise_sigma) or noise_sigma == 0: noise_sigma = 1.0 # Ultimate fallback
+        synthetic_noise = np.random.normal(0, noise_sigma, size=np.sum(flagged_indices))
+        infilled_spectrum[flagged_indices] = synthetic_noise
+        return infilled_spectrum
 
-    elif fit_mode == 'local':
-        # Find contiguous blocks of flagged channels
-        labeled_zones, num_zones = label(flagged_indices)
-        for i in range(1, num_zones + 1):
-            zone_indices = np.where(labeled_zones == i)[0]
-            start_index, end_index = zone_indices[0], zone_indices[-1]
+    # Fit a line (y = k*x + b) in log-log space.
+    # y = log10(spectrum), x = log10(frequency)
+    log_freq = np.log10(frequencies[positive_valid_indices])
+    log_spec = np.log10(spectrum[positive_valid_indices])
+    k, log_A = np.polyfit(log_freq, log_spec, 1)
 
-            # Select padding data on both sides of the RFI zone
-            left_indices = np.where(valid_indices & (np.arange(len(spectrum)) < start_index))[0]
-            right_indices = np.where(valid_indices & (np.arange(len(spectrum)) > end_index))[0]
-
-            # Ensure we have enough points for a stable fit
-            if len(left_indices) < 2 or len(right_indices) < 2:
-                # Fallback to a global fit if a local one is not possible
-                k, log_A = np.polyfit(np.log10(frequencies[valid_indices]), np.log10(spectrum[valid_indices]), 1)
-            else:
-                fit_indices = np.concatenate([left_indices[-local_fit_padding:], right_indices[:local_fit_padding]])
-                log_freq = np.log10(frequencies[fit_indices])
-                log_spec = np.log10(spectrum[fit_indices])
-                k, log_A = np.polyfit(log_freq, log_spec, 1)
-
-            # Generate model values just for this flagged zone
-            power_law_model[zone_indices] = (10**log_A) * (frequencies[zone_indices]**k)
+    # Generate the power-law model (A * f^k) for all frequencies
+    power_law_model = (10**log_A) * (frequencies**k)
 
     # --- 3. Infill and Add Noise ---
-    # First, infill the flagged regions with the power-law model
+    # Infill the flagged regions with the smooth power-law model
     infilled_spectrum[flagged_indices] = power_law_model[flagged_indices]
 
-    # Measure the noise from the valid regions of the original spectrum
-    # The noise is the standard deviation of the data after subtracting the model
+    # Measure the noise from the valid regions by comparing against the model
     residual = spectrum[valid_indices] - power_law_model[valid_indices]
-    # Ensure we don't include NaNs or zeros in the noise calculation
+    
+    # Calculate noise sigma, ensuring we only use finite numbers
     noise_sigma = np.std(residual[np.isfinite(residual)])
+
+    # Final safety check for the noise value
+    if not np.isfinite(noise_sigma) or noise_sigma <= 0:
+        noise_sigma = 1e-6 # Use a tiny floor value if noise is zero or undefined
 
     # Generate synthetic noise for the flagged channels
     synthetic_noise = np.random.normal(0, noise_sigma, size=np.sum(flagged_indices))
@@ -317,6 +291,7 @@ def apply_windowed_delay_filter(
     fft_filter[-notch_width:] = window[notch_width:]
     
     # 4. Apply the filter
+    # if weights = None then use uniform weights
     delay_spectrum = np.fft.fft(spectrum * weights)
     filtered_delay_spectrum = delay_spectrum * fft_filter
     filtered_spectrum = np.fft.ifft(filtered_delay_spectrum)
