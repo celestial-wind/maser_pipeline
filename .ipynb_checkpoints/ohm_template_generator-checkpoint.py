@@ -182,6 +182,55 @@ def generate_intrinsic_maser(vel_axis_kms: np.ndarray) -> np.ndarray:
         
     return total_spectrum
 
+
+def generate_intrinsic_maser_injection(vel_axis_kms: np.ndarray) -> tuple[np.ndarray, dict]:
+    """
+    Generates a single, randomized intrinsic OHM spectrum in velocity space
+    and returns its physical attributes.
+
+    Returns
+    -------
+    tuple[np.ndarray, dict]
+        - A 1D numpy array of the normalized synthetic OHM profile.
+        - A dictionary containing the randomized physical parameters used.
+    """
+    # This dictionary will store the ground truth for this maser's shape
+    attributes = {}
+    
+    # Draw physical parameters from log-normal distributions
+    attributes['fwhm_broad'] = np.random.lognormal(np.log(250), 0.5)
+    attributes['fwhm_1667'] = np.random.lognormal(np.log(100), 0.4)
+    attributes['fwhm_1665'] = np.random.lognormal(np.log(80), 0.5)
+    
+    attributes['amp_ratio_1667_over_1665'] = np.random.lognormal(np.log(2.0), 0.3)
+    attributes['amp_ratio_broad_over_1667'] = np.random.lognormal(np.log(0.3), 0.5)
+
+    # Convert FWHM to sigma for the Gaussian function
+    sigma_broad_kms = fwhm_to_sigma(attributes['fwhm_broad'])
+    sigma_1667_kms = fwhm_to_sigma(attributes['fwhm_1667'])
+    sigma_1665_kms = fwhm_to_sigma(attributes['fwhm_1665'])
+    
+    # Velocity separation between the two narrow lines
+    vel_sep_kms = C_KMS * (NU_1667_REST - NU_1665_REST) / NU_1667_REST
+
+    # Set amplitudes based on drawn ratios
+    amp_1667 = 1.0
+    amp_1665 = amp_1667 / attributes['amp_ratio_1667_over_1665']
+    amp_broad = amp_1667 * attributes['amp_ratio_broad_over_1667']
+
+    # Generate the three Gaussian components
+    spec_1667 = gaussian(vel_axis_kms, 0.0, sigma_1667_kms, amp_1667)
+    spec_1665 = gaussian(vel_axis_kms, -vel_sep_kms, sigma_1665_kms, amp_1665)
+    spec_broad = gaussian(vel_axis_kms, 0.0, sigma_broad_kms, amp_broad)
+
+    # Combine and normalize the final spectrum
+    total_spectrum = spec_1667 + spec_1665 + spec_broad
+    if np.max(total_spectrum) > 0:
+        total_spectrum /= np.max(total_spectrum)
+        
+    return total_spectrum, attributes
+
+
 # =============================================================================
 # --- Simple Template Generators ---
 # =============================================================================
@@ -245,6 +294,35 @@ def generate_optimal_template(
     return template
 
 
+def create_full_spectrum_template(
+    template_profile: np.ndarray,
+    start_idx: int,
+    end_idx: int,
+    num_channels: int
+) -> np.ndarray:
+    """
+    Places a compact template profile into a full-length spectrum array.
+
+    Args:
+        template_profile: The compact 1D template array.
+        start_idx: The starting index for the template in the full spectrum.
+        end_idx: The ending index for the template in the full spectrum.
+        num_channels: The total number of channels in the full spectrum.
+
+    Returns:
+        A 1D numpy array of length `num_channels` with the template placed at
+        the correct location and zeros elsewhere.
+    """
+    # Create an empty array of the full spectrum size
+    full_template = np.zeros(num_channels)
+
+    # If the indices are valid, place the profile into the full array
+    if start_idx is not None and template_profile.size > 0:
+        full_template[start_idx:end_idx] = template_profile
+
+    return full_template
+
+    
 def process_to_native_resolution_and_target_z(
     intrinsic_template_v: np.ndarray,
     vel_axis_kms: np.ndarray,

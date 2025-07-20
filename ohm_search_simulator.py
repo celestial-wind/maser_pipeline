@@ -15,7 +15,7 @@ This module is responsible for:
 
 import numpy as np
 from tqdm.auto import tqdm
-from typing import Dict, Tuple, List, Any
+from typing import Dict, Tuple, List, Any, Optional, Union
 from scipy.signal import correlate
 from scipy.signal.windows import tukey
 
@@ -68,9 +68,6 @@ def generate_realistic_rfi_mask(freqs: np.ndarray, percentage_random=0.01) -> np
     weights[random_indices] = 0
     
     return weights
-
-
-import numpy as np
 
 
 def infill_rfi(
@@ -156,7 +153,13 @@ def infill_rfi(
     return infilled_spectrum
 
 
-def apply_dayneu_filter(spectrum, frequencies_mhz, delay_cutoff_ns, weights=None):
+def apply_dayneu_filter(
+    spectrum: np.ndarray,
+    frequencies_mhz: np.ndarray,
+    delay_cutoff_ns: float,
+    weights: np.array =None,
+    cache: dict = None
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Applies a Dayenu delay filter to a 1D spectrum to remove smooth foregrounds.
 
@@ -240,10 +243,12 @@ def apply_dayneu_filter(spectrum, frequencies_mhz, delay_cutoff_ns, weights=None
         filter_centers=filter_center,
         filter_half_widths=filter_half_width,
         mode='dayenu',
-        filter_dims=1
+        filter_dims=1,
+        cache=cache
     )
 
     return filtered_spectrum, foreground_model
+
 
 def apply_windowed_delay_filter(
     spectrum: np.ndarray,
@@ -372,69 +377,173 @@ def generate_instrument_weights(model_type: str, num_pixels: int) -> np.ndarray:
 # =============================================================================
 
 
+def _create_single_injection(
+    pixel_idx: int,
+    freqs: np.ndarray,
+    vel_axis: np.ndarray,
+    randomize_profile: bool,
+    master_template_v: np.ndarray = None
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Generates a single, noiseless synthetic OHM signal profile.
+
+    Args:
+        pixel_idx: The pixel index where the signal will be placed.
+        freqs: The frequency axis in MHz.
+        vel_axis: The velocity axis in km/s for the intrinsic profile.
+        randomize_profile: If True, a new random intrinsic profile is generated.
+                           If False, `master_template_v` is used.
+        master_template_v: A pre-generated intrinsic template. Required if
+                           `randomize_profile` is False.
+
+    Returns:
+        - The full-band, noiseless profile of the injected signal.
+        - The ground truth dictionary for this injection.
+    """
+    intrinsic_attributes = {} # Initialize empty dict
+    
+    if randomize_profile:
+        # Now unpacks both the spectrum and the attributes dictionary
+        intrinsic_template_v, intrinsic_attributes = otg.generate_intrinsic_maser_injection(vel_axis_kms=vel_axis)
+    else:
+        # Use the provided master template
+        if master_template_v is None:
+            raise ValueError("master_template_v must be provided when randomize_profile is False.")
+        intrinsic_template_v = master_template_v
+    
+    # Randomize the redshift and amplitude for this injection
+    z_inject = np.random.uniform(1.1, 3.1)
+    amp_inject = np.abs(np.random.normal(loc=7, scale=2))
+    
+    # Redshift and resample the profile
+    template, start_idx, end_idx = otg.process_to_native_resolution_and_target_z(
+        intrinsic_template_v=intrinsic_template_v, vel_axis_kms=vel_axis,
+        z=z_inject, native_freq_grid=freqs
+    )
+    if template is None or template.size == 0 or np.max(template) == 0:
+        return None, None
+        
+    # Create and scale the full-band profile
+    noiseless_profile = np.zeros_like(freqs)
+    scaled_template = template * (amp_inject / np.max(template))
+    noiseless_profile[start_idx:end_idx] = scaled_template
+    
+    # Create the base ground truth entry
+    g_truth_entry = {
+        'pixel_index': pixel_idx, 'z': z_inject, 'amp': amp_inject,
+        'noiseless_profile': noiseless_profile
+    }
+    
+    # Merge the intrinsic physical attributes into the ground truth dictionary
+    g_truth_entry.update(intrinsic_attributes)
+    
+    return noiseless_profile, g_truth_entry
+
 def generate_sky_image_cube(
-    num_pixels: int, 
-    freqs: np.ndarray, 
+    num_pixels: int,
+    freqs: np.ndarray,
     noise_sigma_base: float = 0.5,
-    num_injections: int = 100, 
+    num_injections: int = 100,
     sky_model: str = 'gdsm',
     noise_model: str = 'uniform',
-) -> Tuple[np.ndarray, Dict, np.ndarray]:
+    return_foregrounds_only: bool = False,
+    randomize_injections: bool = False
+) -> Tuple[np.ndarray, Dict, np.ndarray, Optional[np.ndarray]]:
     """
     Generates a simulated sky data cube with selectable physical models.
+
+    This function builds a data cube by layering three components:
+    1. A smooth-spectrum foreground model (e.g., GDSM).
+    2. A set of injected, synthetic OHM signals.
+    3. Instrumental noise with specified properties.
+
+    Parameters
+    ----------
+    num_pixels : int
+        The number of independent pixels (lines of sight) in the data cube.
+    freqs : np.ndarray
+        The 1D array of frequency channels in MHz.
+    noise_sigma_base : float, optional
+        The base standard deviation of the noise for a uniformly weighted pixel.
+        Defaults to 0.5.
+    num_injections : int, optional
+        The number of synthetic OHM signals to inject into the cube.
+        Defaults to 100.
+    sky_model : str, optional
+        The foreground model to use ('gdsm' or 'blank'). Defaults to 'gdsm'.
+    noise_model : str, optional
+        The noise weighting model to use ('uniform' or other defined models).
+        Defaults to 'uniform'.
+    return_foregrounds_only : bool, optional
+        If True, an additional data cube containing only the pure foreground
+        component will be returned before signals and noise are added.
+        Defaults to False.
+
+    Returns
+    -------
+    Tuple[np.ndarray, Dict, np.ndarray, Optional[np.ndarray]]
+        - data_cube (np.ndarray): The final 2D data cube containing
+          (foregrounds + signals + noise).
+        - ground_truth (Dict): A dictionary detailing all injected signals.
+        - sky_weights (np.ndarray): The per-pixel instrumental weights.
+        - foreground_cube (np.ndarray or None): If `return_foregrounds_only`
+          is True, this is the 2D cube with only the foregrounds. Otherwise, None.
     """
     print(f"Generating simulation cube with {num_pixels} pixels...")
 
-    # --- New, cleaner sky model generation ---
-    print(f"  - Generating '{sky_model}' sky model.")
+    # --- Step 1: Generate the Foreground Sky Model ---
+    print(f"  - Generating '{sky_model}' sky model...")
     if sky_model == 'blank':
         data_cube = np.zeros((num_pixels, len(freqs)))
     elif sky_model == 'gdsm':
-        # Call the new, more powerful function
         data_cube = generate_gdsm_cube(num_pixels, freqs)
     else:
         raise ValueError(f"Unknown sky_model: {sky_model}")
-    # ----------------------------------------
 
-    # Get instrumental weights based on selected noise model
-    sky_weights = generate_instrument_weights(noise_model, num_pixels)
-    
-    # Inject synthetic OHM signals
-    ground_truth = {'injections': []}
+    # If requested, store a clean copy of the foregrounds now,
+    # before adding any other components.
+    foreground_cube = np.copy(data_cube) if return_foregrounds_only else None
+
+    # --- Step 2: Inject Synthetic OHM Signals ---
+    # This ensures it's always available for both injection modes.
     vel_axis = np.linspace(-1200, 1200, 4096)
+    
+    if randomize_injections:
+        print(f"  - Injecting {num_injections} RANDOMIZED synthetic OHM signals...")
+        master_template = None
+    else:
+        print(f"  - Injecting {num_injections} IDENTICAL synthetic OHM signals...")
+        # Pre-generate the master intrinsic template once for efficiency
+        master_template = otg.generate_optimal_template(vel_axis_kms=vel_axis, N_population=5000, verbose=False)
+
+    ground_truth = {'injections': []}
     injection_indices = np.random.choice(num_pixels, num_injections, replace=False)
-    # Pre-generate the master intrinsic template once for efficiency
-    intrinsic_template_v = otg.generate_optimal_template(vel_axis_kms=vel_axis, N_population=5000, verbose=False)
-
+    
     for pixel_idx in tqdm(injection_indices, desc="Injecting Signals"):
-        z_inject = np.random.uniform(1.1, 3.1)
-        amp_inject = np.abs(np.random.normal(loc=7, scale=2))
-        
-        # Transform the master template for this specific injection
-        template, start_idx, end_idx = otg.process_to_native_resolution_and_target_z(
-            intrinsic_template_v=intrinsic_template_v, vel_axis_kms=vel_axis,
-            z=z_inject, native_freq_grid=freqs
+        # The injection logic is now neatly contained in the helper function
+        noiseless_profile, g_truth_entry = _create_single_injection(
+            pixel_idx=pixel_idx,
+            freqs=freqs,
+            vel_axis=vel_axis,
+            randomize_profile=randomize_injections,
+            master_template_v=master_template
         )
-        if template.size == 0 or np.max(template) == 0: continue
         
-        noiseless_profile = np.zeros_like(freqs)
-        scaled_template = template * (amp_inject / np.max(template))
-        noiseless_profile[start_idx:end_idx] = scaled_template
-        
-        g_truth_entry = {'pixel_index': pixel_idx, 'z': z_inject, 'amp': amp_inject, 'noiseless_profile': noiseless_profile}
-        ground_truth['injections'].append(g_truth_entry)
-        
-        # Add the signal directly into the GDSM cube
-        data_cube[pixel_idx, :] += noiseless_profile
+        if noiseless_profile is not None:
+            ground_truth['injections'].append(g_truth_entry)
+            # Add the signal directly into the main data cube
+            data_cube[pixel_idx, :] += noiseless_profile
 
-    # Add instrumental noise, scaled by the weights
-    print("\n  - Adding instrumental noise...")
+    # --- Step 3: Add Instrumental Noise ---
+    print(f"\n  - Adding instrumental noise based on '{noise_model}' model...")
+    sky_weights = generate_instrument_weights(noise_model, num_pixels)
     for i in tqdm(range(num_pixels), desc="Adding Noise"):
+        # Scale noise by the per-pixel instrumental weight
         pixel_noise_sigma = noise_sigma_base / sky_weights[i]
         noise = np.random.normal(0, pixel_noise_sigma, len(freqs))
         data_cube[i, :] += noise
         
-    return data_cube, ground_truth, sky_weights
+    return data_cube, ground_truth, sky_weights, foreground_cube
 
     
 # =============================================================================
@@ -595,9 +704,218 @@ def run_matched_filter_fft(
 
     return snr_spectrum
 
-import numpy as np
+
+def run_matched_filter_search(
+    data_cube: np.ndarray,
+    templates: Union[Dict, List[Dict]],
+    noise_spectrum: np.ndarray = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Runs a matched filter search over a data cube using a template or bank.
+
+    This function iterates through each spectrum (pixel) in the data cube and
+    applies a whitened matched filter using the provided template(s). It is
+    optimized for templates that are shorter than the full spectrum and
+    assumes a zero-lag alignment (direct match).
+
+    Parameters
+    ----------
+    data_cube : np.ndarray
+        The 2D data cube (pixels x frequencies) to be searched. This data
+        should already be foreground-filtered.
+    templates : Union[Dict, List[Dict]]
+        The template(s) to search for. Can be a single template dictionary
+        or a list of dictionaries (a template bank). Each dictionary must
+        contain 'prof', 'start', and 'end' keys.
+    noise_spectrum : np.ndarray, optional
+        A pre-calculated 1D array of the per-channel noise standard deviation.
+        If not provided, it will be estimated from the `data_cube` using
+        `np.nanstd`. Defaults to None.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        - snr_cube (np.ndarray): A 2D array with the same shape as `data_cube`,
+          containing the peak SNR found at each channel for each pixel.
+        - noise_spectrum (np.ndarray): The 1D per-channel noise standard
+          deviation used for the calculation.
+    """
+    print("--- Running Matched Filter Search ---")
+
+    # --- 1. Estimate the noise PER CHANNEL if not provided ---
+    if noise_spectrum is None:
+        print("Estimating noise spectrum from the data cube...")
+        noise_spectrum = np.nanstd(data_cube, axis=0)
+        # Handle potential NaNs or zeros in the noise estimate
+        noise_spectrum[np.isnan(noise_spectrum) | (noise_spectrum <= 0)] = 1e-9
+
+    # --- 2. Normalize input to handle both single template and bank ---
+    if isinstance(templates, dict):
+        template_bank = [templates] # Wrap a single template in a list
+    else:
+        template_bank = templates
+
+    # --- 3. Run the fast, direct-match search ---
+    snr_cube = np.zeros_like(data_cube)
+    n_pixels = data_cube.shape[0]
+
+    for i in tqdm(range(n_pixels), desc="Processing Pixels"):
+        spectrum = data_cube[i, :]
+        pixel_snr_spectrum = np.zeros_like(spectrum)
+
+        # Slide each template from the bank across the spectrum
+        for temp_info in template_bank:
+            start = temp_info['start']
+            end = temp_info['end']
+            template_profile = temp_info['prof']
+
+            # Get the slice of the data and noise corresponding to this template
+            data_segment = spectrum[start:end]
+            noise_segment = noise_spectrum[start:end]
+
+            # Calculate the effective normalization factor for the whitened template
+            norm_effective = np.sqrt(np.sum((template_profile / noise_segment)**2))
+            if norm_effective < 1e-6:
+                continue
+
+            # Correlate the whitened data with the template
+            weighted_data = data_segment / noise_segment**2
+            snr = np.sum(weighted_data * template_profile) / norm_effective
+
+            # "Paint" the single SNR value across the template's footprint if it's an improvement
+            current_snr_segment = pixel_snr_spectrum[start:end]
+            update_mask = snr > current_snr_segment
+            pixel_snr_spectrum[start:end][update_mask] = snr
+
+        snr_cube[i, :] = pixel_snr_spectrum
+
+    print("\nSNR cube generation complete.")
+    return snr_cube, noise_spectrum
 
 
+def run_subspace_matched_filter(
+    data_cube: np.ndarray,
+    templates: Union[Dict, List[Dict]],
+    noise_covariance: np.ndarray,
+    num_modes_to_subtract: int = 5,
+    edge_trim_channels: int = 25
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Runs an intermediate matched filter using subspace projection (PCA),
+    operating on the central part of the band.
+    """
+    print(f"--- Running Subspace Matched Filter (Subtracting {num_modes_to_subtract} Modes) ---")
+
+    # --- Step 1: Find the dominant noise modes ---
+    print("Finding dominant noise modes from covariance matrix...")
+    eigenvalues, eigenvectors = np.linalg.eigh(noise_covariance)
+    top_modes = eigenvectors[:, -num_modes_to_subtract:]
+
+    # --- Step 2: Clean the data cube by subtracting the noise modes ---
+    # We will only modify the central, trimmed part of the data.
+    data_cube_cleaned = np.copy(data_cube)
+    channel_slice = slice(edge_trim_channels, -edge_trim_channels)
+
+    for i in tqdm(range(data_cube.shape[0]), desc="Cleaning Data with PCA"):
+        # Extract the full spectrum
+        spectrum_full = data_cube[i, :]
+        # Trim it to match the dimensions of the noise modes
+        spectrum_trimmed = spectrum_full[channel_slice]
+        
+        # Now the dot product will work correctly
+        coeffs = np.dot(spectrum_trimmed, top_modes)
+        noise_model = np.dot(top_modes, coeffs)
+        
+        # Subtract the noise model to get the cleaned, trimmed spectrum
+        cleaned_spectrum_trimmed = spectrum_trimmed - noise_model
+        
+        # Place the cleaned segment back into the full-sized cube
+        data_cube_cleaned[i, channel_slice] = cleaned_spectrum_trimmed
+
+    # --- Step 3: Run the standard whitened matched filter on the cleaned data ---
+    snr_cube, final_noise_spectrum = run_matched_filter_search(
+        data_cube=data_cube_cleaned,
+        templates=templates
+    )
+    
+    return snr_cube, final_noise_spectrum
+
+    
+def run_generalized_matched_filter(
+    data_cube: np.ndarray,
+    templates: Union[Dict, List[Dict]],
+    noise_covariance: np.ndarray,
+    regularization: float = 1e-5
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Runs a Generalized Matched Filter search using a regularized noise
+    covariance matrix for numerical stability.
+
+    Parameters
+    ----------
+    data_cube : np.ndarray
+        The 2D data cube (pixels x frequencies) to be searched.
+    templates : Union[Dict, List[Dict]]
+        The template(s) to search for.
+    noise_covariance : np.ndarray
+        The 2D (N_CHANNELS x N_CHANNELS) noise covariance matrix, C_n.
+    regularization : float, optional
+        A small value added to the diagonal of the covariance matrix to
+        ensure it is well-conditioned before inversion. Defaults to 1e-5.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        - snr_cube (np.ndarray): The resulting 2D SNR cube.
+        - C_n_inv (np.ndarray): The inverse of the regularized covariance matrix.
+    """
+    print("--- Running Generalized Matched Filter Search ---")
+
+    # --- 1. Regularize and Invert the Covariance Matrix ---
+    print(f"Regularizing and inverting the noise covariance matrix...")
+    
+    # Add a small epsilon to the diagonal for numerical stability
+    C_n_reg = noise_covariance + regularization * np.eye(noise_covariance.shape[0])
+    
+    # Now invert the stabilized matrix
+    C_n_inv = np.linalg.pinv(C_n_reg)
+
+    # (The rest of the function is identical to before)
+    if isinstance(templates, dict):
+        template_bank = [templates]
+    else:
+        template_bank = templates
+        
+    snr_cube = np.zeros_like(data_cube)
+    n_pixels = data_cube.shape[0]
+
+    for i in tqdm(range(n_pixels), desc="Processing Pixels (Generalized)"):
+        spectrum = data_cube[i, :]
+        pixel_snr_spectrum = np.zeros_like(spectrum)
+
+        for temp_info in template_bank:
+            start, end = temp_info['start'], temp_info['end']
+            C_n_inv_segment = C_n_inv[start:end, start:end]
+            s = temp_info['prof']
+            d = spectrum[start:end]
+            
+            norm_sq = s.T @ C_n_inv_segment @ s
+            if norm_sq < 1e-6: continue
+            norm = np.sqrt(norm_sq)
+            
+            score = s.T @ C_n_inv_segment @ d
+            snr = score / norm
+            
+            current_snr_segment = pixel_snr_spectrum[start:end]
+            update_mask = snr > current_snr_segment
+            pixel_snr_spectrum[start:end][update_mask] = snr
+            
+        snr_cube[i, :] = pixel_snr_spectrum
+
+    print("\nSNR cube generation complete.")
+    return snr_cube, C_n_inv
+
+    
 def run_threshold_search(filtered_spectrum: np.ndarray, noise_sigma_per_channel: np.ndarray) -> float:
     """
     Finds the peak significance of a signal in a single channel.

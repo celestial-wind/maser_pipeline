@@ -20,11 +20,13 @@ This module provides three main categories of tools:
 
 import numpy as np
 from sklearn.cluster import DBSCAN
+from scipy.optimize import curve_fit
 from typing import List, Dict, Any, Tuple, Optional
 import matplotlib.pyplot as plt
 import cmocean
 
 import ohm_search_simulator as oss
+import ohm_template_generator as otg
 
 # =============================================================================
 # --- Candidate Finding Algorithms ---
@@ -190,6 +192,186 @@ def match_candidates_to_truth_3d(
         'false_positives': false_positives,
         'false_negatives': false_negatives,
     }
+
+
+# =============================================================================
+# --- Candidate Fitting ---
+# =============================================================================
+
+def freq_to_idx(freq_axis_mhz: np.ndarray, target_freq_mhz: float) -> int:
+    """
+    Converts a frequency in MHz to the closest integer channel index.
+
+    Args:
+        freq_axis_mhz: The array of frequency channels in MHz.
+        target_freq_mhz: The target frequency in MHz to find.
+
+    Returns:
+        The integer index of the channel closest to the target frequency.
+    """
+    # Find the index of the minimum absolute difference
+    return np.argmin(np.abs(freq_axis_mhz - target_freq_mhz))
+
+
+def gaussian_model(x: np.ndarray, amp: float, mean: float, stddev: float) -> np.ndarray:
+    """A simple 1D Gaussian model."""
+    return amp * np.exp(-0.5 * ((x - mean) / stddev)**2)
+
+
+def fit_candidate_gaussian(
+    candidate: Dict[str, Any],
+    data_cube: np.ndarray,
+    freqs_mhz: np.ndarray,
+    noise_spectrum: np.ndarray,
+    fit_padding_channels: int = 20,
+    plot_diagnostics: bool = False
+) -> Tuple[Dict, Dict]:
+    """
+    Fits a simple Gaussian profile to a candidate's spectrum.
+
+    This is a simplified diagnostic fit to recover basic parameters like
+    amplitude, center frequency, and width (stddev).
+
+    Parameters
+    ----------
+    candidate : Dict
+        The candidate dictionary, containing location info.
+    data_cube : np.ndarray
+        The 2D data cube (filtered) to extract the spectrum from.
+    freqs_mhz : np.ndarray
+        The frequency axis in MHz.
+    noise_spectrum : np.ndarray
+        The 1D per-channel noise standard deviation.
+    fit_padding_channels : int, optional
+        The number of channels on each side of the candidate's peak to use
+        for the fit.
+
+    Returns
+    -------
+    Tuple[Dict, Dict]
+        - A dictionary of the best-fit parameters ('amp', 'mean', 'stddev').
+        - A dictionary of the 1-sigma errors on those parameters.
+        Returns two empty dictionaries if the fit fails.
+    """
+    try:
+        # --- 1. Extract Data for Fitting ---
+        # Get pixel index (e.g., from 'centroid_y')
+        pixel_idx = int(candidate['centroid_y'])
+
+        # Get the frequency value from the candidate and convert it to the
+        # closest integer channel index using our helper function.
+        centroid_freq = candidate['centroid_z_freq']
+        freq_idx = freq_to_idx(freqs_mhz, centroid_freq)
+
+        spectrum = data_cube[pixel_idx, :]
+        start = max(0, freq_idx - fit_padding_channels)
+        end = min(len(freqs_mhz), freq_idx + fit_padding_channels)
+        
+        freqs_fit = freqs_mhz[start:end]
+        spectrum_fit = spectrum[start:end]
+        noise_fit = noise_spectrum[start:end]
+        
+        # (The rest of the function is the same...)
+        p0 = [spectrum_fit.max(), freqs_mhz[freq_idx], 0.2]
+        lower_bounds = [0, -np.inf, 1e-3]; upper_bounds = [np.inf, np.inf, np.inf]
+
+        if plot_diagnostics:
+            plt.figure(figsize=(8, 5))
+            plt.errorbar(freqs_fit, spectrum_fit, yerr=noise_fit, fmt='o', label='Data to Fit', capsize=3)
+            guess_curve = gaussian_model(freqs_fit, *p0)
+            plt.plot(freqs_fit, guess_curve, 'r--', label='Initial Guess')
+            plt.title(f"Diagnostic for Candidate at Pixel {pixel_idx}, Freq ~{p0[1]:.2f} MHz")
+            plt.xlabel("Frequency (MHz)"); plt.ylabel("Amplitude"); plt.legend(); plt.grid(True)
+            plt.show()
+
+        popt, pcov = curve_fit(
+            gaussian_model, xdata=freqs_fit, ydata=spectrum_fit, p0=p0,
+            sigma=noise_fit, absolute_sigma=True, maxfev=5000,
+            bounds=(lower_bounds, upper_bounds)
+        )
+        
+        chi2 = np.sum(((spectrum_fit - gaussian_model(freqs_fit, *popt)) / noise_fit)**2)
+        dof = len(spectrum_fit) - len(popt)
+        
+        fit_params = {'amp': popt[0], 'mean': popt[1], 'stddev': abs(popt[2]), 'chi2_red': chi2 / dof if dof > 0 else np.inf}
+        fit_errs = {'amp_err': np.sqrt(pcov[0,0]), 'mean_err': np.sqrt(pcov[1,1]), 'stddev_err': np.sqrt(pcov[2,2])}
+        
+        return fit_params, fit_errs
+
+    except (RuntimeError, KeyError, ValueError) as e:
+        if plot_diagnostics:
+            print(f"--- Fit FAILED. Error: {e} ---")
+        return {}, {}
+
+
+def fit_candidate_forward_model(
+    candidate: Dict[str, Any],
+    data_cube: np.ndarray,
+    freqs_mhz: np.ndarray,
+    noise_spectrum: np.ndarray,
+    delay_filter_func: callable, # Pass the filter function itself
+    delay_cut_ns: float,
+    fit_padding_channels: int = 20,
+    plot_diagnostics: bool = False
+) -> Tuple[Dict, Dict]:
+    """
+    Fits a candidate using a forward model of a Gaussian convolved with the
+    delay filter. This is the most accurate fitting method.
+    """
+    try:
+        # --- 1. Extract Data for Fitting (same as before) ---
+        pixel_idx = int(candidate['centroid_y'])
+        freq_idx = freq_to_idx(freqs_mhz, candidate['centroid_z_freq'])
+        spectrum = data_cube[pixel_idx, :]
+        start = max(0, freq_idx - fit_padding_channels)
+        end = min(len(freqs_mhz), freq_idx + fit_padding_channels)
+        freqs_fit = freqs_mhz[start:end]
+        spectrum_fit = spectrum[start:end]
+        noise_fit = noise_spectrum[start:end]
+        if spectrum_fit.size < 3: return {}, {}
+
+        # --- 2. Define the Forward Model for the Fitter ---
+        # This nested function generates a clean Gaussian, filters it,
+        # and returns the appropriate slice for comparison.
+        def filtered_gaussian_model(x_slice, amp, mean, stddev):
+            # a. Generate the clean, intrinsic Gaussian on the FULL frequency axis
+            clean_model_full = gaussian_model(freqs_mhz, amp, mean, stddev)
+            
+            # b. Filter this ideal model with the SAME pipeline filter
+            filtered_model_full = delay_filter_func(
+                spectrum=clean_model_full,
+                weights=np.ones_like(freqs_mhz),
+                freqs_mhz=freqs_mhz,
+                delay_cut_ns=delay_cut_ns
+            )
+            
+            # c. Return the slice corresponding to the data being fit
+            return filtered_model_full[start:end]
+
+        # --- 3. Perform the Fit ---
+        p0 = [spectrum_fit.max(), freqs_mhz[freq_idx], 0.2]
+        lower_bounds = [0, -np.inf, 1e-3]; upper_bounds = [np.inf, np.inf, np.inf]
+        
+        popt, pcov = curve_fit(
+            filtered_gaussian_model, # Use our new forward model
+            xdata=freqs_fit, ydata=spectrum_fit, p0=p0,
+            sigma=noise_fit, absolute_sigma=True, maxfev=5000,
+            bounds=(lower_bounds, upper_bounds)
+        )
+        
+        chi2 = np.sum(((spectrum_fit - gaussian_model(freqs_fit, *popt)) / noise_fit)**2)
+        dof = len(spectrum_fit) - len(popt)
+        
+        fit_params = {'amp': popt[0], 'mean': popt[1], 'stddev': abs(popt[2]), 'chi2_red': chi2 / dof if dof > 0 else np.inf}
+        fit_errs = {'amp_err': np.sqrt(pcov[0,0]), 'mean_err': np.sqrt(pcov[1,1]), 'stddev_err': np.sqrt(pcov[2,2])}
+        
+        return fit_params, fit_errs
+
+    except (RuntimeError, KeyError, ValueError) as e:
+        if plot_diagnostics:
+            print(f"--- Fit FAILED. Error: {e} ---")
+        return {}, {}
+
 
 # =============================================================================
 # --- Performance Assessment ---
