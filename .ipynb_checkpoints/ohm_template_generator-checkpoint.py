@@ -17,7 +17,8 @@ This module provides functions to:
 import numpy as np
 from scipy.signal import windows
 from tqdm.auto import tqdm
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict, Any
+import ohm_search_simulator as oss
 
 # =============================================================================
 # --- Constants ---
@@ -322,6 +323,104 @@ def create_full_spectrum_template(
 
     return full_template
 
+
+def create_filtered_template_bank(
+    intrinsic_template_v: np.ndarray,
+    vel_axis_kms: np.ndarray,
+    z_grid: np.ndarray,
+    native_freq_grid: np.ndarray,
+    delay_cut_ns: float
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Builds a bank of templates, applying a delay filter to each one.
+
+    Saves both a compact and a full version of each template for analysis.
+    """
+    template_bank_compact = []
+    template_bank_full = []
+    n_channels = len(native_freq_grid)
+
+    for z in tqdm(z_grid, desc="Building Filtered Templates"):
+        compact_template, start_idx, end_idx = process_to_native_resolution_and_target_z(
+            intrinsic_template_v=intrinsic_template_v,
+            vel_axis_kms=vel_axis_kms,
+            z=z,
+            native_freq_grid=native_freq_grid
+        )
+
+        if compact_template.size == 0 or start_idx is None:
+            continue
+
+        full_spectrum_template = create_full_spectrum_template(
+            compact_template, start_idx, end_idx, n_channels
+        )
+
+        # Apply the delay filter to the full-sized template
+        filtered_full_template = oss.apply_windowed_delay_filter(
+            spectrum=full_spectrum_template,
+            weights=np.ones(n_channels),  # Use uniform weights for template creation
+            freqs_mhz=native_freq_grid,
+            delay_cut_ns=delay_cut_ns
+        )
+
+        # --- NEW STEP: Re-normalize the template power to 1 ---
+        power_after_filtering = np.sqrt(np.sum(filtered_full_template**2))
+        if power_after_filtering > 0:
+            # Divide by its own norm to give it unit power
+            normalized_template = filtered_full_template / power_after_filtering
+        else:
+            # If template is all zeros, do nothing
+            normalized_template = filtered_full_template
+        # --- END OF NEW STEP ---
+
+        filtered_compact_template = filtered_full_template[start_idx:end_idx]
+
+        # Store the full template
+        template_bank_full.append({
+            'prof': filtered_full_template,
+            'start': start_idx,
+            'end': end_idx,
+            'z': z
+        })
+
+        # Store the compact template
+        template_bank_compact.append({
+            'prof': filtered_compact_template,
+            'start': start_idx,
+            'end': end_idx,
+            'z': z
+        })
+
+    return template_bank_compact, template_bank_full
+
+
+def verify_template_alignment(
+    full_template: np.ndarray,
+    freq_grid_mhz: np.ndarray,
+    expected_z: float,
+    tolerance_mhz: float = 1.0
+):
+    """
+    Verifies that the peak of a template aligns with its expected frequency.
+    This is your critical alignment check.
+    """
+    expected_freq = oss.z_to_freq(expected_z)
+    # Use the absolute value to handle potential negative sidelobes from the filter
+    peak_freq_index = np.argmax(np.abs(full_template))
+    actual_peak_freq = freq_grid_mhz[peak_freq_index]
+    freq_diff = abs(actual_peak_freq - expected_freq)
+    is_aligned = freq_diff <= tolerance_mhz
+
+    print(f"✔️ Template Alignment Check (z={expected_z:.4f}):")
+    print(f"  - Expected Center Frequency: {expected_freq:.2f} MHz")
+    print(f"  - Actual Peak Frequency:   {actual_peak_freq:.2f} MHz")
+    print(f"  - Frequency Difference:    {freq_diff:.2f} MHz")
+    if is_aligned:
+        print(f"  - ✅ Aligned within {tolerance_mhz} MHz tolerance.")
+    else:
+        print(f"  - ⚠️ WARNING: Template peak is NOT aligned.")
+
+    return is_aligned
     
 def process_to_native_resolution_and_target_z(
     intrinsic_template_v: np.ndarray,

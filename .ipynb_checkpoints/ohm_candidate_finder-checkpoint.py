@@ -22,7 +22,9 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 from scipy.optimize import curve_fit
 from typing import List, Dict, Any, Tuple, Optional
+from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
+from collections import defaultdict
 import cmocean
 
 import ohm_search_simulator as oss
@@ -31,6 +33,116 @@ import ohm_template_generator as otg
 # =============================================================================
 # --- Candidate Finding Algorithms ---
 # =============================================================================
+
+
+def validate_from_ground_truth(
+    snr_cube: np.ndarray,
+    ground_truth: dict,
+    freqs_mhz: np.ndarray,
+    N_pix_x: int,
+) -> list:
+    """
+    Checks the SNR cube at the known locations of injected masers from the ground truth.
+
+    This function bypasses searching and instead directly measures the performance
+    of the matched filter on the signals that were known to be injected.
+
+    Args:
+        snr_cube: The 3D cube of Signal-to-Noise Ratios.
+        ground_truth: The dictionary containing the list of injected masers.
+        freqs_mhz: The array of frequency channels.
+        N_pix_x: The width of the simulated sky patch in pixels.
+
+    Returns:
+        A list of dictionaries, one for each ground truth maser, containing its
+        measured SNR and location information.
+    """
+    validation_results = []
+    
+    injections = ground_truth.get('injections', [])
+    if not injections:
+        print("No injections found in the ground_truth dictionary.")
+        return []
+
+    print(f"Validating the SNR for {len(injections)} ground truth injections...")
+
+    for maser_info in tqdm(injections, desc="Checking Ground Truth Injections"):
+        pixel_idx = maser_info['pixel_index']
+        true_z = maser_info['z']
+        true_freq = oss.z_to_freq(true_z)
+        
+        # Find the frequency channel index closest to the maser's true frequency
+        freq_idx = np.argmin(np.abs(freqs_mhz - true_freq))
+        
+        # Look up the SNR value at that exact pixel and frequency channel
+        measured_snr = snr_cube[pixel_idx, freq_idx]
+        
+        # Calculate the spatial (x, y) coordinates from the pixel index
+        y_coord = pixel_idx // N_pix_x
+        x_coord = pixel_idx % N_pix_x
+        
+        validation_results.append({
+            'max_snr': measured_snr,
+            'pixel_idx': pixel_idx,
+            'centroid_x': x_coord,
+            'centroid_y': y_coord,
+            'centroid_freq_mhz': freqs_mhz[freq_idx], # Using the closest channel freq as the centroid
+            'centroid_z': true_z, # Using the exact true redshift
+            'is_detected': measured_snr > 5.0 # Example detection threshold
+        })
+        
+    return validation_results
+
+
+def find_candidates_top_n_per_pixel(
+    snr_cube: np.ndarray,
+    freqs_mhz: np.ndarray,
+    N_pix_x: int,
+    top_n: int = 3,
+    snr_threshold: float = 5.0,
+    centroid_window: int = 2
+) -> list:
+    """
+    Finds top N candidates and calculates a full 3D centroid for each.
+    """
+    candidate_list = []
+    num_pixels, num_freqs = snr_cube.shape
+
+    for i in tqdm(range(num_pixels), desc="Finding Top N Candidates Per Pixel"):
+        snr_spectrum = snr_cube[i, :]
+        if len(snr_spectrum) > top_n:
+            top_indices = np.argpartition(snr_spectrum, -top_n)[-top_n:]
+        else:
+            top_indices = np.arange(len(snr_spectrum))
+
+        for freq_idx in top_indices:
+            snr_value = snr_spectrum[freq_idx]
+            if snr_value > snr_threshold:
+                start = max(0, freq_idx - centroid_window)
+                end = min(num_freqs, freq_idx + centroid_window + 1)
+                snrs_in_window = snr_cube[i, start:end]
+                freqs_in_window = freqs_mhz[start:end]
+                
+                snr_sum = np.sum(snrs_in_window)
+                if snr_sum > 0:
+                    centroid_freq = np.sum(snrs_in_window * freqs_in_window) / snr_sum
+                else:
+                    centroid_freq = freqs_mhz[freq_idx]
+                
+                centroid_y = i // N_pix_x
+                centroid_x = i % N_pix_x
+
+                candidate_list.append({
+                    'max_snr': snr_value,
+                    'pixel_idx': i,
+                    'centroid_x': centroid_x,
+                    'centroid_y': centroid_y,
+                    'centroid_freq_mhz': centroid_freq,
+                    'centroid_z_freq': centroid_freq
+                })
+                
+    print(f"Found {len(candidate_list)} candidates above SNR={snr_threshold}.")
+    return sorted(candidate_list, key=lambda x: x['max_snr'], reverse=True)
 
 
 def find_candidates_3d_dbscan(
@@ -193,7 +305,7 @@ def match_candidates_to_truth_3d(
         'false_negatives': false_negatives,
     }
 
-
+    
 # =============================================================================
 # --- Candidate Fitting ---
 # =============================================================================
