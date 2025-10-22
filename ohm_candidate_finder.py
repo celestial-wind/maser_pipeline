@@ -1,5 +1,6 @@
 # ohm_candidate_finder.py
 
+
 """
 A module for post-processing search outputs (SNR cubes) to identify, 
 characterize, and validate candidate signals.
@@ -18,6 +19,8 @@ This module provides three main categories of tools:
       locations, signal spectra, and overall search performance.
 """
 
+
+# External library dependencies
 import numpy as np
 from sklearn.cluster import DBSCAN
 from scipy.optimize import curve_fit
@@ -27,8 +30,11 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import cmocean
 
+
+# Local module dependencies
 import ohm_search_simulator as oss
 import ohm_template_generator as otg
+
 
 # =============================================================================
 # --- Candidate Finding Algorithms ---
@@ -40,6 +46,7 @@ def validate_from_ground_truth(
     ground_truth: dict,
     freqs_mhz: np.ndarray,
     N_pix_x: int,
+    threshold: float
 ) -> list:
     """
     Checks the SNR cube at the known locations of injected masers from the ground truth.
@@ -88,7 +95,7 @@ def validate_from_ground_truth(
             'centroid_y': y_coord,
             'centroid_freq_mhz': freqs_mhz[freq_idx], # Using the closest channel freq as the centroid
             'centroid_z': true_z, # Using the exact true redshift
-            'is_detected': measured_snr > 5.0 # Example detection threshold
+            'is_detected': measured_snr > threshold # Example detection threshold
         })
         
     return validation_results
@@ -310,6 +317,7 @@ def match_candidates_to_truth_3d(
 # --- Candidate Fitting ---
 # =============================================================================
 
+
 def freq_to_idx(freq_axis_mhz: np.ndarray, target_freq_mhz: float) -> int:
     """
     Converts a frequency in MHz to the closest integer channel index.
@@ -419,75 +427,71 @@ def fit_candidate_gaussian(
 def fit_candidate_forward_model(
     candidate: Dict[str, Any],
     data_cube: np.ndarray,
-    freqs_mhz: np.ndarray,
     noise_spectrum: np.ndarray,
-    delay_filter_func: callable, # Pass the filter function itself
+    freqs_mhz: np.ndarray,
+    delay_filter_func,
     delay_cut_ns: float,
-    fit_padding_channels: int = 20,
-    plot_diagnostics: bool = False
-) -> Tuple[Dict, Dict]:
+    N_PIX_X: int  # Add N_PIX_X to the function signature
+) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, float]]]:
     """
-    Fits a candidate using a forward model of a Gaussian convolved with the
-    delay filter. This is the most accurate fitting method.
+    Fits a forward model to a candidate signal, with corrected key access.
     """
-    try:
-        # --- 1. Extract Data for Fitting (same as before) ---
-        pixel_idx = int(candidate['centroid_y'])
-        freq_idx = freq_to_idx(freqs_mhz, candidate['centroid_z_freq'])
-        spectrum = data_cube[pixel_idx, :]
-        start = max(0, freq_idx - fit_padding_channels)
-        end = min(len(freqs_mhz), freq_idx + fit_padding_channels)
-        freqs_fit = freqs_mhz[start:end]
-        spectrum_fit = spectrum[start:end]
-        noise_fit = noise_spectrum[start:end]
-        if spectrum_fit.size < 3: return {}, {}
+    # --- THIS IS THE FIX ---
+    # Calculate the flat pixel index from the candidate's x and y centroids.
+    pixel_idx = int(candidate['centroid_y'] * N_PIX_X + candidate['centroid_x'])
+    # Use the correct key for the frequency centroid.
+    center_freq = candidate['centroid_z_freq']
+    # --- END FIX ---
 
-        # --- 2. Define the Forward Model for the Fitter ---
-        # This nested function generates a clean Gaussian, filters it,
-        # and returns the appropriate slice for comparison.
-        def filtered_gaussian_model(x_slice, amp, mean, stddev):
-            # a. Generate the clean, intrinsic Gaussian on the FULL frequency axis
-            clean_model_full = gaussian_model(freqs_mhz, amp, mean, stddev)
-            
-            # b. Filter this ideal model with the SAME pipeline filter
-            filtered_model_full = delay_filter_func(
-                spectrum=clean_model_full,
-                weights=np.ones_like(freqs_mhz),
-                freqs_mhz=freqs_mhz,
-                delay_cut_ns=delay_cut_ns
-            )
-            
-            # c. Return the slice corresponding to the data being fit
-            return filtered_model_full[start:end]
+    freq_idx = np.argmin(np.abs(freqs_mhz - center_freq))
+    padding = 25
+    start, end = max(0, freq_idx - padding), min(len(freqs_mhz), freq_idx + padding)
+    
+    freqs_slice = freqs_mhz[start:end]
+    data_slice = data_cube[pixel_idx, start:end]
+    noise_slice = noise_spectrum[start:end]
 
-        # --- 3. Perform the Fit ---
-        p0 = [spectrum_fit.max(), freqs_mhz[freq_idx], 0.2]
-        lower_bounds = [0, -np.inf, 1e-3]; upper_bounds = [np.inf, np.inf, np.inf]
-        
-        popt, pcov = curve_fit(
-            filtered_gaussian_model, # Use our new forward model
-            xdata=freqs_fit, ydata=spectrum_fit, p0=p0,
-            sigma=noise_fit, absolute_sigma=True, maxfev=5000,
-            bounds=(lower_bounds, upper_bounds)
+    def forward_model(freqs, amp, mean, stddev):
+        intrinsic_model_full = gaussian_model(freqs_mhz, amp=amp, mean=mean, stddev=stddev)
+        filtered_model_full = delay_filter_func(
+            spectrum=intrinsic_model_full, weights=np.ones_like(freqs_mhz),
+            freqs_mhz=freqs_mhz, delay_cut_ns=delay_cut_ns
         )
+        return filtered_model_full[start:end]
+
+    # Smart initial guesses!
+    test_template = gaussian_model(freqs_mhz, amp=1.0, mean=center_freq, stddev=0.5)
+    filtered_test = delay_filter_func(test_template, np.ones_like(freqs_mhz), freqs_mhz, delay_cut_ns)
+    amp_attenuation = np.max(filtered_test)
+    measured_snr = candidate['peak_snr']
+    noise_at_center = noise_spectrum[freq_idx]
+    amp_guess = (measured_snr * noise_at_center) / max(amp_attenuation, 0.1)
+    p0 = [amp_guess, center_freq, 0.5]
+
+    try:
+        fit_params_arr, pcov = curve_fit(
+            forward_model, freqs_slice, data_slice, p0=p0, sigma=noise_slice,
+            bounds=([0, center_freq - 2, 0.1], [np.inf, center_freq + 2, 2.0])
+        )
+        fit_errs_arr = np.sqrt(np.diag(pcov))
+        fit_params = {'amp': fit_params_arr[0], 'mean': fit_params_arr[1], 'stddev': fit_params_arr[2]}
+        fit_errs = {'amp_err': fit_errs_arr[0], 'mean_err': fit_errs_arr[1], 'stddev_err': fit_errs_arr[2]}
         
-        chi2 = np.sum(((spectrum_fit - gaussian_model(freqs_fit, *popt)) / noise_fit)**2)
-        dof = len(spectrum_fit) - len(popt)
-        
-        fit_params = {'amp': popt[0], 'mean': popt[1], 'stddev': abs(popt[2]), 'chi2_red': chi2 / dof if dof > 0 else np.inf}
-        fit_errs = {'amp_err': np.sqrt(pcov[0,0]), 'mean_err': np.sqrt(pcov[1,1]), 'stddev_err': np.sqrt(pcov[2,2])}
+        model_fit = forward_model(freqs_slice, **fit_params)
+        residual = data_slice - model_fit
+        chi2 = np.sum((residual / noise_slice)**2)
+        dof = len(data_slice) - len(p0)
+        fit_params['chi2_red'] = chi2 / dof if dof > 0 else np.inf
         
         return fit_params, fit_errs
-
-    except (RuntimeError, KeyError, ValueError) as e:
-        if plot_diagnostics:
-            print(f"--- Fit FAILED. Error: {e} ---")
-        return {}, {}
+    except (RuntimeError, ValueError):
+        return None, None
 
 
 # =============================================================================
 # --- Performance Assessment ---
 # =============================================================================
+
 
 def calculate_performance_stats(matched_results: Dict) -> Dict:
     """Calculates summary statistics from matched results."""
@@ -534,6 +538,7 @@ def plot_snr_map(
     plt.xlabel('Pixel X-coordinate')
     plt.ylabel('Pixel Y-coordinate')
     plt.show()
+
 
 def plot_spectrum(
     freqs: np.ndarray,

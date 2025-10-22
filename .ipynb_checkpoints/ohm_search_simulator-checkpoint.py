@@ -1,5 +1,6 @@
 # ohm_search_simulator.py
 
+
 """
 The core module for the OHM search simulation pipeline.
 
@@ -13,23 +14,30 @@ This module is responsible for:
    ranging from simple thresholding to advanced, "pipeline-aware" matched filters.
 """
 
+
+# External library dependencies
 import numpy as np
 from tqdm.auto import tqdm
 from typing import Dict, Tuple, List, Any, Optional, Union
 from scipy.signal import correlate
 from scipy.signal.windows import tukey
-
-# External library dependencies
 import healpy as hp
 from pygdsm import GlobalSkyModel
 from uvtools import dspec
+
 
 # Local module dependencies
 import ohm_template_generator as otg
 
 
+# =============================================================================
+# --- Core Utility Functions ---
+# =============================================================================
+
+
 def z_to_freq(z, rest_freq=1667.359): return rest_freq / (1 + z)
 def freq_to_z(freq, rest_freq=1667.359): return (rest_freq / freq) - 1
+
 
 # =============================================================================
 # --- Component Functions: RFI and Foreground Filtering ---
@@ -153,6 +161,125 @@ def infill_rfi(
     return infilled_spectrum
 
 
+
+def infill_rfi_iterative(
+    spectrum: np.ndarray,
+    weights: np.ndarray,
+    frequencies: np.ndarray,
+    n_iter: int = 5,
+    sigma_clip: float = 3.0,
+    global_noise_sigma: Optional[float] = None
+) -> np.ndarray:
+    """
+    Infills RFI regions using a robust iterative fit and a global noise estimate.
+
+    This version corrects a bug in the iterative fitter and uses an optional
+    global noise estimate to prevent bright signals from skewing the
+    amplitude of the infilled noise.
+    """
+    infilled_spectrum = np.copy(spectrum)
+    valid_indices = weights > 0
+    flagged_indices = ~valid_indices
+
+    if not np.any(flagged_indices):
+        return infilled_spectrum
+
+    fit_indices = valid_indices & (spectrum > 0)
+
+    if np.sum(fit_indices) < 2:
+        noise_sigma = global_noise_sigma if global_noise_sigma is not None else 1.0
+        infilled_spectrum[flagged_indices] = np.random.normal(0, noise_sigma, size=np.sum(flagged_indices))
+        return infilled_spectrum
+
+    # Iteratively clip outliers and re-fit the power law
+    for i in range(n_iter):
+        log_freq = np.log10(frequencies[fit_indices])
+        log_spec = np.log10(spectrum[fit_indices])
+        
+        if len(log_freq) < 2: break
+        k, log_A = np.polyfit(log_freq, log_spec, 1)
+
+        current_model_for_clip = (10**log_A) * (frequencies[fit_indices]**k)
+        residual = spectrum[fit_indices] - current_model_for_clip
+        sigma = np.std(residual)
+        if sigma == 0: break
+
+        # This is the corrected logic for updating the fit indices
+        is_not_outlier = np.abs(residual) < (sigma_clip * sigma)
+        current_fit_global_indices = np.where(fit_indices)[0]
+        clean_subset_indices = current_fit_global_indices[is_not_outlier]
+        
+        new_fit_mask = np.zeros_like(spectrum, dtype=bool)
+        new_fit_mask[clean_subset_indices] = True
+        fit_indices = new_fit_mask & (spectrum > 0)
+
+    # --- Final Infilling ---
+    final_power_law_model = (10**log_A) * (frequencies**k)
+    infilled_spectrum[flagged_indices] = final_power_law_model[flagged_indices]
+
+    # Calculate the robust local noise sigma from the clean, clipped data
+    final_clean_residual = spectrum[fit_indices] - final_power_law_model[fit_indices]
+    local_noise_sigma = np.std(final_clean_residual)
+
+    # --- Use Global Noise Estimate if Local is Anomalous ---
+    noise_sigma_to_use = local_noise_sigma
+    if global_noise_sigma is not None and local_noise_sigma > (2.0 * global_noise_sigma):
+        # If local noise is >2x the global estimate, it's likely skewed.
+        # Fall back to the more reliable global value.
+        noise_sigma_to_use = global_noise_sigma
+
+    if not np.isfinite(noise_sigma_to_use) or noise_sigma_to_use <= 0:
+        noise_sigma_to_use = 1e-6
+
+    synthetic_noise = np.random.normal(0, noise_sigma_to_use, size=np.sum(flagged_indices))
+    infilled_spectrum[flagged_indices] += synthetic_noise
+
+    return infilled_spectrum
+
+
+def find_and_mask_outliers(
+    spectrum: np.ndarray,
+    sigma_threshold: float = 7.0,
+    mask_bandwidth_channels: int = 5
+) -> np.ndarray:
+    """
+    Identifies significant outliers and masks a defined bandwidth around them.
+
+    Args:
+        spectrum: The input spectrum.
+        sigma_threshold: The N-sigma threshold to identify an outlier peak.
+        mask_bandwidth_channels: The number of channels to mask on EACH side of a detected peak.
+
+    Returns:
+        A new spectrum with a region around each outlier replaced by the median.
+    """
+    # Use robust statistics (Median Absolute Deviation) to find outliers
+    median_val = np.median(spectrum)
+    abs_deviation = np.abs(spectrum - median_val)
+    mad = np.median(abs_deviation)
+    robust_sigma = mad * 1.4826
+    
+    # Find the indices of all channels that exceed the outlier threshold
+    outlier_indices = np.where(abs_deviation > (sigma_threshold * robust_sigma))[0]
+    
+    if len(outlier_indices) == 0:
+        return spectrum # No outliers found, return the original spectrum
+
+    # Create a boolean mask for the channels to be replaced
+    channels_to_mask = np.zeros_like(spectrum, dtype=bool)
+    for idx in outlier_indices:
+        # Define the window to mask around the outlier
+        start = max(0, idx - mask_bandwidth_channels)
+        end = min(len(spectrum), idx + mask_bandwidth_channels + 1)
+        channels_to_mask[start:end] = True
+
+    # Create a new spectrum and replace the masked regions with the median
+    masked_spectrum = np.copy(spectrum)
+    masked_spectrum[channels_to_mask] = median_val
+    
+    return masked_spectrum
+
+    
 def apply_dayneu_filter(
     spectrum: np.ndarray,
     frequencies_mhz: np.ndarray,
@@ -505,7 +632,6 @@ def _create_single_injection(
     return noiseless_profile, g_truth_entry
 
 
-
 def generate_sky_image_cube(
     num_pixels: int,
     freqs: np.ndarray,
@@ -513,31 +639,22 @@ def generate_sky_image_cube(
     num_injections: int = 100,
     sky_model: str = 'gdsm',
     randomize_injections: bool = False,
-    injection_amp: Optional[float] = None,
-    # (other sky model parameters can remain for future use)
-    pl_spec_index: float = -2.5,
-    pl_base_amp_k: float = 300.0,
-    num_point_sources: int = 50,
-    ps_amp_range_k: Tuple[float, float] = (10.0, 100.0),
-    ps_spec_idx_range: Tuple[float, float] = (-2.8, -2.2)
-) -> Tuple[np.ndarray, Dict, np.ndarray, np.ndarray]:
+    injection_amp: Optional[float] = None
+) -> Tuple[np.ndarray, Dict, np.ndarray, np.ndarray, np.ndarray]:
     """
     Generates a simulated sky data cube with a simple, uniform noise model.
 
-    This function builds a data cube by layering three components:
-    1. A smooth-spectrum foreground model (e.g., GDSM).
-    2. A set of injected, synthetic OHM signals.
-    3. Uniform instrumental noise.
+    **UPDATED:** This version now returns clean, separate cubes for the
+    foregrounds and the noise component for accurate diagnostics.
 
     Returns
     -------
-    Tuple[np.ndarray, Dict, np.ndarray, np.ndarray]
-        - data_cube (np.ndarray): The final 2D data cube containing
-          (foregrounds + signals + noise).
-        - ground_truth (Dict): A dictionary detailing all injected signals.
-        - sky_weights (np.ndarray): An array of uniform weights (all ones).
-        - noise_and_foreground_cube (np.ndarray): The 2D cube with only
-          the GDSM foregrounds and the uniform noise.
+    Tuple[np.ndarray, Dict, np.ndarray, np.ndarray, np.ndarray]
+        - data_cube: The final 2D cube (foregrounds + signals + noise).
+        - ground_truth: A dictionary detailing all injected signals.
+        - sky_weights: An array of uniform weights (all ones).
+        - foreground_cube: The clean, noiseless foreground component.
+        - noise_cube: The clean Gaussian noise component.
     """
     print(f"Generating simulation cube with {num_pixels} pixels...")
     num_freqs = len(freqs)
@@ -545,69 +662,42 @@ def generate_sky_image_cube(
     # --- Step 1: Generate the Foreground Sky Model ---
     print(f"  - Generating '{sky_model}' foreground model...")
     if sky_model == 'gdsm':
-        # Generate the clean foregrounds from the GDSM model
         foreground_cube = generate_gdsm_cube(num_pixels, freqs)
-    elif sky_model == 'powerlaw_sources':
-        # This logic remains for flexibility if you want to use it later
-        background_spec = generate_powerlaw_background(
-            freqs, base_amplitude=pl_base_amp_k, spectral_index=pl_spec_index
-        )
-        foreground_cube = np.tile(background_spec, (num_pixels, 1))
-        point_source_cube = generate_point_sources_cube(
-            num_pixels, freqs,
-            num_sources=num_point_sources,
-            amp_range=ps_amp_range_k,
-            spectral_index_range=ps_spec_idx_range
-        )
-        foreground_cube += point_source_cube
     else: # 'blank' or other models
         foreground_cube = np.zeros((num_pixels, num_freqs))
 
-
-    # --- Step 2: Add Simple, Uniform Instrumental Noise ---
+    # --- Step 2: Generate Simple, Uniform Instrumental Noise ---
     print(f"  - Adding simple uniform Gaussian noise...")
-    # Generate the noise cube in one vectorized operation with a single sigma
     noise_cube = np.random.normal(0, noise_sigma_base, (num_pixels, num_freqs))
     
-    # Create the cube that contains ONLY the noise and the foregrounds.
-    # This is the crucial return value for the theoretical model.
-    noise_and_foreground_cube = foreground_cube + noise_cube
+    # Combine the two to create the base data cube
+    data_cube = foreground_cube + noise_cube
     
-    # The sky_weights are now simple and uniform (all ones).
+    # The sky_weights are simple and uniform.
     sky_weights = np.ones((num_pixels, num_freqs))
 
-
     # --- Step 3: Inject Synthetic OHM Signals ---
-    # The injection process now adds signals on top of the noisy foregrounds.
-    # Start with a copy of the noisy foreground cube.
-    data_cube = np.copy(noise_and_foreground_cube)
-    
+    print(f"  - Injecting {num_injections} synthetic OHM signals...")
     vel_axis = np.linspace(-1200, 1200, 4096)
     
-    # This logic correctly handles the randomize_injections flag
     if randomize_injections:
-        print(f"  - Injecting {num_injections} RANDOMIZED synthetic OHM signals...")
         master_template = None
     else:
-        print(f"  - Injecting {num_injections} IDENTICAL synthetic OHM signals...")
-        # Pre-generate the master intrinsic template once for efficiency
         master_template = otg.generate_optimal_template(vel_axis_kms=vel_axis, N_population=5000, verbose=False)
 
     ground_truth = {'injections': []}
     injection_indices = np.random.choice(num_pixels, num_injections, replace=False)
 
     for pixel_idx in tqdm(injection_indices, desc="Injecting Signals"):
-        # The injection logic is neatly contained in the helper function
         noiseless_profile, g_truth_entry = _create_single_injection(
             pixel_idx=pixel_idx,
             freqs=freqs,
             vel_axis=vel_axis,
-            randomize_profile=randomize_injections, # Pass the flag here
+            randomize_profile=randomize_injections,
             master_template_v=master_template
         )
         
         if noiseless_profile is not None:
-            # If a fixed amplitude is given, override the random one
             if injection_amp is not None:
                 old_amp = g_truth_entry['amp']
                 scale_factor = injection_amp / old_amp
@@ -617,72 +707,13 @@ def generate_sky_image_cube(
             ground_truth['injections'].append(g_truth_entry)
             # Add the signal to the final data cube
             data_cube[pixel_idx, :] += noiseless_profile
-
             
-    return data_cube, ground_truth, sky_weights, noise_and_foreground_cube
+    # Return all components, including the new separate cubes
+    return data_cube, ground_truth, sky_weights, foreground_cube, noise_cube
 
-    
 # =============================================================================
 # --- Search and Filtering Algorithms ---
 # =============================================================================
-
-
-# def run_matched_filter_direct(
-#     spectrum: np.ndarray,
-#     template: np.ndarray,
-#     weights: np.ndarray,
-#     noise_sigma: float,
-# ) -> float:
-#     """
-#     Calculates the SNR of a signal at a specific, known alignment using a
-#     weighted matched filter.
-
-#     This function performs a direct summation "convolution" (dot product) at a
-#     single lag, which is suitable for data with masked or flagged RFI zones.
-
-#     Parameters
-#     ----------
-#     spectrum : np.ndarray
-#         The 1D array of the observed spectrum containing the signal and noise.
-#     template : np.ndarray
-#         The 1D array representing the ideal, noise-free signal template.
-#     weights : np.ndarray
-#         A 1D array of weights corresponding to the spectrum. RFI-flagged
-#         channels should have a weight of 0.
-#     noise_sigma : float
-#         The standard deviation (sigma) of the noise in the spectrum.
-#     frequencies_mhz : np.ndarray
-#         The frequency axis for the spectrum in MHz. Required for filtering.
-#     filter_template : bool, optional
-#         If True, the template will be filtered with the Dayenu delay filter
-#         before matching. This is the recommended approach if the spectrum
-#         has been filtered. Defaults to False, which uses a simple mean
-#         subtraction as an approximation.
-#     delay_cutoff_ns : float, optional
-#         The delay cutoff in nanoseconds to use for the Dayenu filter if
-#         `filter_template` is True. Defaults to 200.0.
-
-#     Returns
-#     -------
-#     float
-#         The calculated signal-to-noise ratio (SNR) of the signal.
-#     """
-#     # normalize the template
-#     template_norm = template/template.max()
-
-#     # Calculate the weighted energy of the normalized template
-#     template_energy = np.sum(template_norm**2 * weights)
-
-#     # Avoid division by zero if template is flat or noise is zero
-#     if template_energy == 0 or noise_sigma <= 0:
-#         return 0.0
-
-#     # Calculate the matched filter score (dot product of spectrum and template)
-#     score = np.sum(spectrum * template_norm * weights)
-
-#     # Return the SNR: the score normalized by template energy and noise level
-#     return score / (np.sqrt(template_energy) * noise_sigma)
-
 
 
 def run_matched_filter_direct(
@@ -752,51 +783,7 @@ def run_matched_filter_cube(
         for j in range(num_freqs):
             noise_sigma = noise_spectrum[j] # noise estimate is per channel
             template = template_bank_full[j]['prof']
-            snr_cube[i, j] = run_matched_filter_direct(spectrum, template, weights, noise_sigma)
-
-    return snr_cube, noise_spectrum
-
-
-def run_matched_filter_cube_with_bank(
-    data_cube: np.ndarray,
-    template_bank_full: List[Dict[str, Any]],
-    freqs_mhz: np.ndarray,
-    weights: np.ndarray,
-    noise_spectrum: np.ndarray = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Applies a matched filter to each frequency bin using a pre-computed bank.
-
-    For each frequency bin in the data cube, it finds the closest redshift
-    template in the bank and uses that for the matched filter operation.
-    """
-    num_pixels, num_freqs = data_cube.shape
-    snr_cube = np.zeros_like(data_cube)
-
-    # 1. Use a robust MAD-based noise estimator if not provided
-    if noise_spectrum is None:
-        print("  - Estimating noise with robust MAD estimator...")
-        # Median Absolute Deviation is more robust to outliers than std dev
-        median_abs_dev = np.nanmedian(np.abs(data_cube - np.nanmedian(data_cube, axis=0)), axis=0)
-        noise_spectrum = median_abs_dev * 1.4826 # Conversion factor for equivalence to std dev for Gaussian noise
-
-    # For faster lookup, map each template's z to its profile
-    template_z_map = {template['z']: template['prof'] for template in template_bank_full}
-    available_zs = np.array(sorted(template_z_map.keys()))
-
-    for i in tqdm(range(num_pixels), desc="Applying Matched Filter with Bank"):
-        spectrum = data_cube[i, :]
-        for j in range(num_freqs):
-            noise_sigma = noise_spectrum[j]
-            # 1. Find the redshift for the current frequency channel
-            target_z = freq_to_z(freqs_mhz[j])
-            
-            # 2. Find the closest template in the bank
-            closest_z_idx = np.argmin(np.abs(available_zs - target_z))
-            template_z = available_zs[closest_z_idx]
-            template = template_z_map[template_z]
-            
-            # 3. Perform the matched filter and store the SNR
+            template = template/template.max()
             snr_cube[i, j] = run_matched_filter_direct(spectrum, template, weights, noise_sigma)
 
     return snr_cube, noise_spectrum

@@ -1,5 +1,6 @@
 # ohm_template_generator.py
 
+
 """
 A comprehensive module for generating synthetic OH Megamaser (OHM) profiles 
 and creating matched-filter templates for astronomical searches.
@@ -14,23 +15,40 @@ This module provides functions to:
    search performance comparisons.
 """
 
+
+# External library dependencies
 import numpy as np
 from scipy.signal import windows
+from scipy.interpolate import interp1d
 from tqdm.auto import tqdm
 from typing import Tuple, List, Optional, Dict, Any
+
+
+# Local module dependencies
 import ohm_search_simulator as oss
+
 
 # =============================================================================
 # --- Constants ---
 # =============================================================================
 
+
 C_KMS = 299792.458  # Speed of light in km/s
 NU_1667_REST = 1667.359  # Rest frequency of 1667 MHz line in MHz
 NU_1665_REST = 1665.402  # Rest frequency of 1665 MHz line in MHz
 
-# Example CHIME-like instrumental parameters
+
+# CHIME instrumental parameters
 CHIME_FREQS = np.linspace(400, 800, 1024)
 NATIVE_CHANNEL_WIDTH = np.mean(np.diff(CHIME_FREQS))  # ~0.39 MHz
+
+
+CHIME_CONSTANTS: Dict[str, Any] = {
+    "N_CHANNELS": 1024,
+    "NTAP": 4,
+    "FULL_BW_MHZ": 400.0,
+}
+
 
 # =============================================================================
 # --- Core Utility Functions ---
@@ -49,39 +67,58 @@ def gaussian(x: np.ndarray, mu: float, sigma: float, amplitude: float = 1.0) -> 
     return amplitude * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
 
-def apply_pfb_smoothing(spectrum: np.ndarray, kernel_width: int) -> np.ndarray:
+def _create_pfb_kernel(target_freq_mhz: np.ndarray) -> np.ndarray:
+    """(Internal) Creates the PFB power response kernel using a physically accurate model."""
+    ntap = CHIME_CONSTANTS["NTAP"]
+    n_channels = CHIME_CONSTANTS["N_CHANNELS"]
+    full_bw_mhz = CHIME_CONSTANTS["FULL_BW_MHZ"]
+    
+    M = ntap * n_channels
+    time_idx = np.arange(M) - M // 2
+    filter_coeffs = np.sinc(time_idx / n_channels) * windows.hamming(M)
+
+    N_fft_model = 32768
+    power_response_model = np.abs(np.fft.fft(filter_coeffs, N_fft_model))**2
+    power_response_model_shifted = np.fft.fftshift(power_response_model)
+
+    model_freq_axis = np.fft.fftfreq(N_fft_model, d=1.0 / full_bw_mhz)
+    model_freq_axis_shifted = np.fft.fftshift(model_freq_axis)
+    
+    target_freq_offsets = target_freq_mhz - np.mean(target_freq_mhz)
+    interpolator = interp1d(
+        model_freq_axis_shifted,
+        power_response_model_shifted,
+        bounds_error=False,
+        fill_value=0.0
+    )
+    return interpolator(target_freq_offsets)
+
+
+def apply_pfb_smoothing(
+    spectrum: np.ndarray,
+    spectrum_bw_mhz: Tuple[float, float]
+) -> np.ndarray:
     """
-    Simulates the local spectral leakage of a Polyphase Filter Bank (PFB)
-    by convolving the spectrum with a sinc-Hamming window. [squared for frquency response]
+    Simulates PFB spectral leakage by convolving with a physically accurate kernel.
 
     Args:
-        spectrum: The 1D spectrum to be smoothed.
-        kernel_width: The width of the smoothing kernel in array elements.
+        spectrum: The 1D high-resolution spectrum to be smoothed.
+        spectrum_bw_mhz: A tuple containing the start and end frequency
+                         of the spectrum in MHz, e.g., (599.0, 601.0).
 
     Returns:
         The smoothed 1D spectrum.
     """
-    if kernel_width < 2: return spectrum
-    kernel = create_chime_pfb_window_direct(len(spectrum), ntap=4)
+    # 1. Internally reconstruct the frequency axis from the provided bandwidth info.
+    start_mhz, end_mhz = spectrum_bw_mhz
+    freqs_mhz = np.linspace(start_mhz, end_mhz, len(spectrum))
+
+    # 2. Generate the correctly scaled kernel for that frequency grid.
+    kernel = _create_pfb_kernel(freqs_mhz)
+    
+    # 3. Normalize the kernel and convolve.
     kernel /= np.sum(kernel)
     return np.convolve(spectrum, kernel, mode='same')
-
-
-def create_chime_pfb_window_direct(N, ntap=4):
-    """
-    Direct implementation for CHIME; based on known characteristics of the CHIME Polyphase Filter Bank (PFB)
-    """
-    
-    # Channel index relative to center
-    k = np.arange(N) - N//2
-    
-    # Sinc^2 response
-    sinc_squared = np.sinc(ntap * k / N) ** 2
-    
-    # Apply windowing
-    hamming_window = windows.hamming(N)
-    
-    return sinc_squared * hamming_window
 
     
 def rebin_spectrum(spec_hr: np.ndarray, freq_hr: np.ndarray, freqs_native: np.ndarray) -> np.ndarray:
@@ -261,6 +298,32 @@ def generate_gaussian_template(width: int, sigma_fraction: float = 0.25) -> np.n
 # =============================================================================
 
 
+def verify_template_alignment_by_freq(
+    full_template: np.ndarray,
+    freq_grid_mhz: np.ndarray,
+    expected_freq_mhz: float,
+    template_name: str = "Template",
+    tolerance_mhz: float = 1.0,
+):
+    """
+    Verifies that the peak of a template aligns with its expected center frequency.
+    """
+    # Use the absolute value to handle potential negative sidelobes from the filter
+    peak_freq_index = np.argmax(np.abs(full_template))
+    actual_peak_freq = freq_grid_mhz[peak_freq_index]
+    freq_diff = abs(actual_peak_freq - expected_freq_mhz)
+    is_aligned = freq_diff <= tolerance_mhz
+
+    print(f"✔️ {template_name} Alignment Check (Expected Freq: {expected_freq_mhz:.2f} MHz):")
+    print(f"  - Actual Peak Frequency:   {actual_peak_freq:.2f} MHz")
+    print(f"  - Frequency Difference:    {freq_diff:.2f} MHz")
+    if is_aligned:
+        print(f"  - ✅ Aligned within {tolerance_mhz} MHz tolerance.")
+    else:
+        print(f"  - ⚠️ WARNING: Template peak is NOT aligned.")
+
+        
+
 def generate_optimal_template(
     N_population: int,
     vel_axis_kms: np.ndarray,
@@ -324,6 +387,139 @@ def create_full_spectrum_template(
     return full_template
 
 
+def create_gaussian_template_bank(
+    native_freq_grid: np.ndarray,
+    delay_cut_ns: float,
+    template_width: int = 7, #11
+    sigma_fraction: float = 0.1618 # adjust this
+) -> List[Dict[str, Any]]:
+    """
+    Builds a properly filtered and aligned bank of Gaussian templates.
+
+    For each frequency channel, it places a Gaussian at that channel,
+    filters the full spectrum, and normalizes it.
+    """
+    n_channels = len(native_freq_grid)
+    template_bank_full = []
+    
+    # Generate the short Gaussian profile once
+    gauss_template_short = generate_gaussian_template(template_width, sigma_fraction)
+
+    print("Building aligned Gaussian template bank...")
+    for i in tqdm(range(n_channels), desc="Filtering Gaussian Templates"):
+        # Place the short template centered at the current frequency channel 'i'
+        full_template = np.zeros(n_channels)
+        start = max(0, i - template_width // 2)
+        end = start + template_width
+        if end > n_channels: # Adjust if at the very edge
+            start = n_channels - template_width
+            end = n_channels
+        full_template[start:end] = gauss_template_short
+        
+        # Filter the full-length template using the windowed FFT filter
+        filtered_template = oss.apply_windowed_delay_filter(
+            spectrum=full_template,
+            weights=np.ones(n_channels),
+            freqs_mhz=native_freq_grid,
+            delay_cut_ns=delay_cut_ns
+        )
+        
+        # Normalize the filtered template to unit power
+        power = np.sqrt(np.sum(filtered_template**2))
+        if power > 0:
+            filtered_template /= power
+            
+        template_bank_full.append({'prof': filtered_template})
+        
+    return template_bank_full
+
+
+def create_boxcar_template_bank(
+    native_freq_grid: np.ndarray,
+    delay_cut_ns: float,
+    template_width: int = 7
+) -> List[Dict[str, Any]]:
+    """
+    Builds a properly filtered and aligned bank of boxcar ("top-hat") templates.
+
+    For each frequency channel, it places a boxcar of ones at that channel,
+    filters the full spectrum, and normalizes it.
+    """
+    n_channels = len(native_freq_grid)
+    template_bank_full = []
+    
+    # Generate the short boxcar profile once (it's just an array of ones)
+    boxcar_template_short = np.ones(template_width)
+
+    print("Building aligned boxcar template bank...")
+    for i in tqdm(range(n_channels), desc="Filtering Boxcar Templates"):
+        # Place the short template centered at the current frequency channel 'i'
+        full_template = np.zeros(n_channels)
+        start = max(0, i - template_width // 2)
+        end = start + template_width
+        if end > n_channels: # Adjust if at the very edge
+            start = n_channels - template_width
+            end = n_channels
+        full_template[start:end] = boxcar_template_short
+        
+        # Filter the full-length template using the windowed FFT filter
+        filtered_template = oss.apply_windowed_delay_filter(
+            spectrum=full_template,
+            weights=np.ones(n_channels),
+            freqs_mhz=native_freq_grid,
+            delay_cut_ns=delay_cut_ns
+        )
+        
+        # Normalize the filtered template to unit power
+        power = np.sqrt(np.sum(filtered_template**2))
+        if power > 0:
+            filtered_template /= power
+            
+        template_bank_full.append({'prof': filtered_template})
+        
+    return template_bank_full
+
+
+def create_single_ohm_template_bank(
+    intrinsic_template_v: np.ndarray,
+    vel_axis_kms: np.ndarray,
+    native_freq_grid: np.ndarray,
+    delay_cut_ns: float,
+    z_single: float = 2.0
+) -> List[Dict[str, Any]]:
+    """
+    Builds a template bank where every template is the identical, filtered
+    shape of a single representative OHM profile.
+    """
+    n_channels = len(native_freq_grid)
+    
+    # Generate one representative, filtered OHM shape
+    print(f"Building single OHM template bank based on z={z_single} profile...")
+    compact_template, s, e = process_to_native_resolution_and_target_z(
+        intrinsic_template_v=intrinsic_template_v,
+        vel_axis_kms=vel_axis_kms,
+        z=z_single,
+        native_freq_grid=native_freq_grid
+    )
+    full_template_single = create_full_spectrum_template(compact_template, s, e, n_channels)
+    
+    # Filter and normalize this single shape
+    filtered_single_ohm = oss.apply_windowed_delay_filter(
+        spectrum=full_template_single,
+        weights=np.ones(n_channels),
+        freqs_mhz=native_freq_grid,
+        delay_cut_ns=delay_cut_ns
+    )
+    power = np.sqrt(np.sum(filtered_single_ohm**2))
+    if power > 0:
+        filtered_single_ohm /= power
+
+    # Create the final bank by repeating this single profile for every channel
+    template_bank_full = [{'prof': filtered_single_ohm} for _ in range(n_channels)]
+    
+    return template_bank_full
+
+    
 def create_filtered_template_bank(
     intrinsic_template_v: np.ndarray,
     vel_axis_kms: np.ndarray,
@@ -394,6 +590,83 @@ def create_filtered_template_bank(
     return template_bank_compact, template_bank_full
 
 
+def create_filtered_template_bank_dayneu(
+    intrinsic_template_v: np.ndarray,
+    vel_axis_kms: np.ndarray,
+    z_grid: np.ndarray,
+    native_freq_grid: np.ndarray,
+    delay_cut_ns: float
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Builds a bank of templates, applying the Dayenu filter and re-normalizing.
+
+    This version is updated to use the Dayenu filter to match the data
+    processing pipeline. It saves both a compact and a full version of
+    each normalized template for analysis.
+    """
+    template_bank_compact = []
+    template_bank_full = []
+    n_channels = len(native_freq_grid)
+    
+    # Initialize a cache for the Dayenu filter matrix to improve performance.
+    # The matrix is computed only once on the first call.
+    filter_cache = {}
+
+    for z in tqdm(z_grid, desc="Building Dayenu-Filtered Templates"):
+        # Step 1: Generate the compact, intrinsic template at a given redshift.
+        compact_template, start_idx, end_idx = process_to_native_resolution_and_target_z(
+            intrinsic_template_v=intrinsic_template_v,
+            vel_axis_kms=vel_axis_kms,
+            z=z,
+            native_freq_grid=native_freq_grid
+        )
+
+        if compact_template.size == 0 or start_idx is None:
+            continue
+
+        # Step 2: Place the compact template into a full-sized array.
+        full_spectrum_template = create_full_spectrum_template(
+            compact_template, start_idx, end_idx, n_channels
+        )
+
+        # Step 3: Apply the Dayenu filter to the full-sized template.
+        # This returns the filtered spectrum and the foreground model; we only need the former.
+        filtered_full_template, _ = oss.apply_dayneu_filter(
+            spectrum=full_spectrum_template,
+            frequencies_mhz=native_freq_grid,
+            delay_cutoff_ns=delay_cut_ns,
+            cache=filter_cache # Pass the cache for optimization
+        )
+
+        # Step 4: Re-normalize the template power to 1 to ensure a fair matched filter.
+        power_after_filtering = np.sqrt(np.sum(filtered_full_template**2))
+        if power_after_filtering > 0:
+            # Normalize the template in-place.
+            filtered_full_template /= power_after_filtering
+        
+        # Now the `filtered_full_template` is the final, normalized version.
+
+        # Step 5: Extract the compact profile from the final, normalized template.
+        filtered_compact_template = filtered_full_template[start_idx:end_idx]
+        
+        # Step 6: Store the full and compact versions of the normalized template.
+        template_bank_full.append({
+            'prof': filtered_full_template,
+            'start': start_idx,
+            'end': end_idx,
+            'z': z
+        })
+
+        template_bank_compact.append({
+            'prof': filtered_compact_template,
+            'start': start_idx,
+            'end': end_idx,
+            'z': z
+        })
+
+    return template_bank_compact, template_bank_full
+
+    
 def verify_template_alignment(
     full_template: np.ndarray,
     freq_grid_mhz: np.ndarray,
@@ -421,6 +694,7 @@ def verify_template_alignment(
         print(f"  - ⚠️ WARNING: Template peak is NOT aligned.")
 
     return is_aligned
+
     
 def process_to_native_resolution_and_target_z(
     intrinsic_template_v: np.ndarray,
@@ -458,10 +732,13 @@ def process_to_native_resolution_and_target_z(
     oversampling_factor = native_channel_width_hz / hr_channel_width_hz if hr_channel_width_hz > 0 else 1
     
     # Determine an appropriate smoothing kernel width based on oversampling
-    smoothing_width_hr = int(1.5 * oversampling_factor)
-    if smoothing_width_hr % 2 == 0: smoothing_width_hr += 1 # Ensure odd kernel width
+    # smoothing_width_hr = int(1.5 * oversampling_factor)
+    # if smoothing_width_hr % 2 == 0: smoothing_width_hr += 1 # Ensure odd kernel width
+
+    # Define the frequency span from your high-resolution frequency axis
+    freq_span_mhz = (freq_axis_hr.min(), freq_axis_hr.max())
     
-    smoothed_template = apply_pfb_smoothing(intrinsic_template_v, smoothing_width_hr)
+    smoothed_template = apply_pfb_smoothing(intrinsic_template_v, spectrum_bw_mhz=freq_span_mhz)
 
     # 3. Rebin to native frequency resolution
     # Find the slice of the native frequency grid that the signal falls into
